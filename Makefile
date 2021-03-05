@@ -2,7 +2,7 @@ OPENOCD           ?= openocd
 OPENOCD_INTERFACE ?= interface/stlink-v2.cfg
 OPENOCD_CMDS      ?=
 REV               ?= B
-PYTHON2           ?= python2
+PYTHON           ?= python
 # CFLAGS          += -fdiagnostics-color=auto
 # CFLAGS += -DUSE_FTDI_UART
 
@@ -35,7 +35,7 @@ HALS+=i2c_ex
 OBJS+=src/main.o
 OBJS+=src/usb_device.o src/usbd_cdc_if.o src/usbd_desc.o src/lps25h.o src/led.o src/button.o
 OBJS+=src/cfg.o src/usbcomm.o src/test_support.o src/production_test.o
-OBJS+=src/uwb.o src/uwb_twr_anchor.o src/uwb_sniffer.o src/uwb_twr_tag.o
+OBJS+=src/uwb.o src/uwb_twr_anchor.o src/uwb_sniffer.o src/uwb_twr_tag.o src/uwb_blinker.o
 OBJS+=src/lpp.o src/uwb_tdoa_anchor2.o src/uwb_tdoa_anchor3.o
 
 HALS+=gpio rcc cortex i2c pcd dma pcd_ex rcc_ex spi uart pwr
@@ -109,7 +109,7 @@ reset_and_dfu:
 	$(OBJCOPY) $^ -O binary $@
 
 %.dfu: %.bin
-	$(PYTHON2) tools/make/dfu-convert.py -b $(LOAD_ADDRESS):$^ $@
+	$(PYTHON) tools/make/dfu-convert.py -b $(LOAD_ADDRESS):$^ $@
 
 check_submodules:
-	$(PYTHON2) tools/make/check-for-submodules.py
+	$(PYTHON) tools/make/check-for-submodules.py

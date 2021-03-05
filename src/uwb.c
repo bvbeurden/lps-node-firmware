@@ -42,7 +42,8 @@ extern uwbAlgorithm_t uwbTwrTagAlgorithm;
 extern uwbAlgorithm_t uwbSnifferAlgorithm;
 extern uwbAlgorithm_t uwbTdoaAlgorithm;
 extern uwbAlgorithm_t uwbTdoa2Algorithm;
-extern uwbAlgorithm_t uwbTdoa3Algorithm;
+//extern uwbAlgorithm_t uwbTdoa3Algorithm;
+extern uwbAlgorithm_t uwbBlinkerAlgorithm;
 static uwbAlgorithm_t *algorithm = &dummyAlgorithm;
 
 struct {
@@ -53,7 +54,8 @@ struct {
   {.algorithm = &uwbTwrTagAlgorithm,    .name = "TWR Tag"},
   {.algorithm = &uwbSnifferAlgorithm,   .name = "Sniffer"},
   {.algorithm = &uwbTdoa2Algorithm,     .name = "TDoA Anchor V2"},
-  {.algorithm = &uwbTdoa3Algorithm,     .name = "TDoA Anchor V3"},
+  //{.algorithm = &uwbTdoa3Algorithm,     .name = "TDoA Anchor V3"},
+  {.algorithm = &uwbBlinkerAlgorithm,   .name = "Blinker"},
   {NULL, NULL},
 };
 
