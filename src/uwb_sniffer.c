@@ -69,6 +69,7 @@ static struct ctx_s {
   uint32_t pollPacketRx;
   uint32_t answerPacket;
   uint32_t answerPacketRx;
+  uint32_t clockOffset;
 } ctx;
 
 typedef struct {
@@ -85,6 +86,33 @@ typedef struct {
 static void adjustTxRxTime(dwTime_t *time)
 {
   time->full = (time->full & ~((1 << 9) - 1)) + (1 << 9);
+}
+
+//static uint32_t reverseBytes(uint32_t timestamp){
+//  uint32_t reversed_timestamp = 0;
+//  uint32_t byte = 0;
+//
+//  for (int i=0; i<4; i++){
+//    byte = ((timestamp >> i*8) & 0xFF); // extract byte
+//    reversed_timestamp += (byte << ((3-i)*8)) ;
+//  }
+//
+//  return reversed_timestamp;
+//}
+
+static void getTof(){
+  double tround1, treply1, treply2, tround2, tof, distance, clock_offset;
+  tround1 = ctx.answerPacketRx - ctx.pollPacket;
+  treply1 = ctx.answerPacket - ctx.pollPacketRx;
+  tround2 = ctx.latestPacketRx - ctx.answerPacket;
+  treply2 = ctx.latestPacket - ctx.answerPacketRx;
+  tof = ((tround1*tround2) - (treply1*treply2)) / (tround1 + tround2 + treply1 + treply2);
+
+  distance = ctx.latestPacketRx - ctx.latestPacket;
+  clock_offset = distance - tof;
+
+  ctx.clockOffset = clock_offset;
+  return;
 }
 
 static dwTime_t findTransmitTimeAsSoonAsPossible(dwDevice_t *dev)
@@ -195,42 +223,34 @@ static void handleRxPacket(dwDevice_t *dev)
   uint32_t answer_tx = 0;
   uint32_t answer_rx = 0;
 
-  if (cfgIsBinaryMode()) {
-    write(STDOUT_FILENO, "\xbc", 1);
-    write(STDOUT_FILENO, &arrival.full, 5);
-    write(STDOUT_FILENO, &rxPacket.sourceAddress[0], 1);
-    write(STDOUT_FILENO, &rxPacket.destAddress[0], 1);
-    dataLength -= MAC802154_HEADER_LENGTH;
-    write(STDOUT_FILENO, &dataLength, 2);
-    write(STDOUT_FILENO, rxPacket.payload, dataLength);
-    write(STDOUT_FILENO, &dataLength, 2);  // Length repeated for sync detection
-  } else {
-    printf("From %02x to %02x @%02x%08x: ", rxPacket.sourceAddress[0],
-                                          rxPacket.destAddress[0],
-                                          (unsigned int) arrival.high8,
-                                          (unsigned int) arrival.low32);
+  printf("From %02x to %02x @%02x%08x: ", rxPacket.sourceAddress[0],
+                                        rxPacket.destAddress[0],
+                                        (unsigned int) arrival.high8,
+                                        (unsigned int) arrival.low32);
 
-    for (int i=0; i<(dataLength - MAC802154_HEADER_LENGTH); i++) {
-      printf("%02x", rxPacket.payload[i]);
-    }
-    for (int i=0; i<4; i++) {
-      latest_timestamp += rxPacket.payload[i] << i*8;
-    }
-
-    // if necessary use bitwise operators to get the bytes in the correct order (left and right shift and & operator)
-    printf("\r\n");
-    for (int i=4; i<8; i++) {
-      answer_tx += rxPacket.payload[i] << i*8;
-    }
-    printf("\r\n");
-    for (int i=8; i<12; i++) {
-      answer_rx += rxPacket.payload[i] << i*8;
-    }
+  for (int i=0; i<(dataLength - MAC802154_HEADER_LENGTH); i++) {
+    printf("%02x", rxPacket.payload[i]);
   }
+
+  for (int i=0; i<4; i++) {
+    latest_timestamp += rxPacket.payload[i] << i*8;
+  }
+
+  for (int i=0; i<4; i++) {
+    answer_tx += rxPacket.payload[i+4] << i*8;
+  }
+
+  for (int i=0; i<4; i++) {
+    answer_rx += rxPacket.payload[i+8] << i*8;
+  }
+
   ctx.latestPacketRx = arrival.low32;
   ctx.latestPacket = latest_timestamp;
   ctx.answerPacketRx = answer_rx;
   ctx.answerPacket = answer_tx;
+
+  getTof();
+  printf(" tx time in rx clock: %08x \r\n", (unsigned int) (ctx.clockOffset + ctx.latestPacket));
 }
 
 static uint32_t snifferOnEvent(dwDevice_t *dev, uwbEvent_t event)
