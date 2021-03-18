@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
+
 #include "cfg.h"
 #include "led.h"
 
@@ -62,20 +63,30 @@ static struct ctx_s {
 
   // Information about latest transmitted packet
   uint32_t txTime; // In UWB clock ticks
+  uint8_t txTime_high8;
   uint32_t nextTxTick;
   uint32_t latestPacket;
   uint32_t latestPacketRx;
+  uint8_t latestPacketRx_high8;
   uint32_t pollPacket;
   uint32_t pollPacketRx;
   uint32_t answerPacket;
   uint32_t answerPacketRx;
+  double tof;
   uint32_t clockOffset;
+  double clockRatio;
+  int cycles;
 } ctx;
 
 typedef struct {
   uint32_t txTimeStamp;
   uint32_t remoteTx;
   uint32_t remoteRx;
+  uint32_t txtimelow32;
+  uint8_t txtimehigh8;
+  uint32_t latestrxlow32;
+  uint8_t latestrxhigh8;
+  uint32_t rxEstimation;
 } __attribute__((packed)) rangePacketHeader3_t;
 
 typedef struct {
@@ -88,20 +99,29 @@ static void adjustTxRxTime(dwTime_t *time)
   time->full = (time->full & ~((1 << 9) - 1)) + (1 << 9);
 }
 
-//static uint32_t reverseBytes(uint32_t timestamp){
-//  uint32_t reversed_timestamp = 0;
-//  uint32_t byte = 0;
-//
-//  for (int i=0; i<4; i++){
-//    byte = ((timestamp >> i*8) & 0xFF); // extract byte
-//    reversed_timestamp += (byte << ((3-i)*8)) ;
-//  }
-//
-//  return reversed_timestamp;
-//}
+static void getClockRatio(uint64_t new_receive_rx, uint32_t new_receive_tx){
+  double tx_delay, rx_delay, ratio_tx_rx;
+  double cycle = 4.294967296e9; // 2^32
 
-static void getTof(){
+  tx_delay = new_receive_tx - ctx.latestPacket;
+  rx_delay = new_receive_rx - ctx.latestPacketRx - ((uint64_t) ctx.latestPacketRx_high8 << 32 );
+  // adjust this for storing low32 and high8 bits in separate context variables
+  int n_cycles = ((rx_delay - tx_delay) / cycle) + 0.5 ;
+  ctx.cycles = n_cycles;
+
+
+  ratio_tx_rx = (tx_delay + n_cycles * cycle)/ rx_delay;
+
+  if ( ratio_tx_rx > 0.8 && ratio_tx_rx < 1.2 ){
+    ctx.clockRatio = ratio_tx_rx;
+  }
+
+  return;
+}
+
+static void wirelessSynch(){
   double tround1, treply1, treply2, tround2, tof, distance, clock_offset;
+
   tround1 = ctx.answerPacketRx - ctx.pollPacket;
   treply1 = ctx.answerPacket - ctx.pollPacketRx;
   tround2 = ctx.latestPacketRx - ctx.answerPacket;
@@ -111,8 +131,27 @@ static void getTof(){
   distance = ctx.latestPacketRx - ctx.latestPacket;
   clock_offset = distance - tof;
 
-  ctx.clockOffset = clock_offset;
+  if ( tof > 32500 && tof < 33000 ){
+    ctx.tof = tof;
+    ctx.clockOffset = clock_offset;
+  }
   return;
+}
+
+
+static uint32_t estimateRemoteRx(){
+
+  double remote_rx = ctx.txTime - ctx.clockOffset;
+  double timediff = ctx.txTime - ctx.latestPacketRx;
+  double correction = ( timediff + ctx.cycles * 4.294967296e9) * (ctx.clockRatio - 1) + ctx.tof;
+  remote_rx += correction;
+
+
+  // clock offset follows sawtooth pattern, find out why
+  // when a packet is missed, one of the points of the sawtooth is missed and this causes a spike in the estimated rx roughly equal to the
+  // difference in value of the peaks times the ratio
+
+  return (unsigned int) remote_rx;
 }
 
 static dwTime_t findTransmitTimeAsSoonAsPossible(dwDevice_t *dev)
@@ -136,6 +175,11 @@ static int populateTxData(rangePacketS_t *rangePacket)
   rangePacket->header.txTimeStamp = ctx.txTime;
   rangePacket->header.remoteRx =  ctx.latestPacketRx;
   rangePacket->header.remoteTx = ctx.latestPacket;
+  rangePacket->header.txtimelow32 = ctx.txTime;
+  rangePacket->header.txtimehigh8 = ctx.txTime_high8;
+  rangePacket->header.latestrxlow32 = ctx.latestPacketRx;
+  rangePacket->header.latestrxhigh8 = ctx.latestPacketRx_high8;
+  rangePacket->header.rxEstimation = estimateRemoteRx();
   return sizeof(rangePacket->header);
 }
 
@@ -166,6 +210,7 @@ static void setupTx(dwDevice_t *dev)
   dwTime_t txTime = findTransmitTimeAsSoonAsPossible(dev);
 
   ctx.txTime = txTime.low32;
+  ctx.txTime_high8 = txTime.high8;
 
   setTxData(dev);
 
@@ -191,7 +236,7 @@ static uint32_t startNextEvent(dwDevice_t *dev)
   if (ctx.nextTxTick < now){
 
     setupTx(dev);
-    printf("tx %08x \r\n", (unsigned int) ctx.txTime);
+    printf("tx %02x%08x \r\n", (unsigned int) ctx.txTime_high8, (unsigned int) ctx.txTime);
 
     ctx.pollPacket = ctx.latestPacket;
     ctx.pollPacketRx = ctx.latestPacketRx;
@@ -244,13 +289,19 @@ static void handleRxPacket(dwDevice_t *dev)
     answer_rx += rxPacket.payload[i+8] << i*8;
   }
 
+  getClockRatio(arrival.full, latest_timestamp);
+
   ctx.latestPacketRx = arrival.low32;
+  ctx.latestPacketRx_high8 = arrival.high8;
   ctx.latestPacket = latest_timestamp;
   ctx.answerPacketRx = answer_rx;
   ctx.answerPacket = answer_tx;
 
-  getTof();
-  printf(" tx time in rx clock: %08x \r\n", (unsigned int) (ctx.clockOffset + ctx.latestPacket));
+  wirelessSynch();
+
+  //printf(" tx time in rx clock: %08x ", (unsigned int) (ctx.clockOffset + ctx.latestPacket));
+  printf(" ratio: %0.15f \r\n", ctx.clockRatio);
+  //printf("\r\n");
 }
 
 static uint32_t snifferOnEvent(dwDevice_t *dev, uwbEvent_t event)
@@ -270,17 +321,23 @@ static uint32_t snifferOnEvent(dwDevice_t *dev, uwbEvent_t event)
 
 static void snifferInit(uwbConfig_t * newconfig, dwDevice_t *dev)
 {
-  // Set the LED for anchor mode
-  printf("initialising \r\n");
+
   ctx.anchorId = newconfig->address[0];
   ctx.txTime = 0;
+  ctx.txTime_high8 = 0;
   ctx.nextTxTick = 0;
   ctx.latestPacket = 0;
   ctx.latestPacketRx = 0;
+  ctx.latestPacketRx_high8 = 0;
   ctx.pollPacket = 0;
   ctx.pollPacketRx = 0;
   ctx.answerPacket = 0;
   ctx.answerPacketRx = 0;
+  ctx.tof = 0;
+  ctx.clockOffset = 0;
+  ctx.clockRatio = 1;
+  ctx.cycles = 0;
+  // Set the LED for anchor mode
   ledBlink(ledMode, false);
 }
 
