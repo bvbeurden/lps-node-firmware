@@ -28,7 +28,7 @@ INCLUDES+=-Ilib/freertos/inc
 
 # Platform specific files
 OBJS+=src/f0/startup_stm32f072xb.o src/f0/system_stm32f0xx.o src/f0/stm32f0xx_it.o src/f0/stm32f0xx_hal_msp.o
-OBJS+=src/f0/gpio.o src/f0/i2c.o src/f0/spi.o src/f0/system.o src/f0/usart.o
+OBJS+=src/f0/gpio.o src/f0/i2c.o src/f0/system.o src/f0/usart.o src/f0/spi.o
 OBJS+=src/f0/usbd_conf.o src/eeprom.o src/bootmode.o
 HALS+=i2c_ex
 

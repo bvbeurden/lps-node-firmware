@@ -29,8 +29,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <math.h>
 #include <unistd.h>
-
 
 #include "cfg.h"
 #include "led.h"
@@ -42,6 +43,9 @@
 #include "uwb.h"
 #include "dwOps.h"
 #include "mac.h"
+
+#define NSLOTS 8
+#define NRATIOHIST 5
 
 #define PREAMBLE_LENGTH_S ( 128 * 1017.63e-9 )
 #define PREAMBLE_LENGTH (uint64_t)( PREAMBLE_LENGTH_S * 499.2e6 * 128 )
@@ -75,7 +79,10 @@ static struct ctx_s {
   double tof;
   uint32_t clockOffset;
   double clockRatio;
-  int cycles;
+  double clockRatioHist[NRATIOHIST];
+  int ratioUpdateIndex;
+  //uint32_t rxTimestampsInCurrentClock[NSLOTS];
+  //uint32_t rxTimestampsInRemoteClock[NSLOTS];
 } ctx;
 
 typedef struct {
@@ -101,26 +108,41 @@ static void adjustTxRxTime(dwTime_t *time)
 
 static void getClockRatio(uint64_t new_receive_rx, uint32_t new_receive_tx){
   double tx_delay, rx_delay, ratio_tx_rx;
-  double cycle = 4.294967296e9; // 2^32
+
 
   tx_delay = new_receive_tx - ctx.latestPacket;
-  rx_delay = new_receive_rx - ctx.latestPacketRx - ((uint64_t) ctx.latestPacketRx_high8 << 32 );
-  // adjust this for storing low32 and high8 bits in separate context variables
-  int n_cycles = ((rx_delay - tx_delay) / cycle) + 0.5 ;
-  ctx.cycles = n_cycles;
+  rx_delay = new_receive_rx -  (ctx.latestPacketRx + ((uint64_t) ctx.latestPacketRx_high8 << 32 ));
+
+  ratio_tx_rx = (tx_delay )/ rx_delay;
 
 
-  ratio_tx_rx = (tx_delay + n_cycles * cycle)/ rx_delay;
+  if ( fabs(ratio_tx_rx - 1) < 2e-5 ){
+    ctx.clockRatioHist[ctx.ratioUpdateIndex] = ratio_tx_rx;
+    ctx.ratioUpdateIndex = (ctx.ratioUpdateIndex + 1) % NRATIOHIST;
 
-  if ( ratio_tx_rx > 0.8 && ratio_tx_rx < 1.2 ){
-    ctx.clockRatio = ratio_tx_rx;
+    for (int i = 0; i < NRATIOHIST; i++){
+        int counter = 0;
+        for (int j = 0; j < NRATIOHIST; j++){
+          if (ctx.clockRatioHist[i] < ctx.clockRatioHist[j] ){
+            counter++;
+          }else if (ctx.clockRatioHist[i] > ctx.clockRatioHist[j]){
+            counter--;
+          }
+        }
+
+        if (counter == 0){
+            ctx.clockRatio = ctx.clockRatioHist[i];
+        }
+    }
+
+    //ctx.clockRatio = ctx.clockRatioHist[1];
   }
 
   return;
 }
 
 static void wirelessSynch(){
-  double tround1, treply1, treply2, tround2, tof, distance, clock_offset;
+  double tround1, treply1, treply2, tround2, tof, distance;
 
   tround1 = ctx.answerPacketRx - ctx.pollPacket;
   treply1 = ctx.answerPacket - ctx.pollPacketRx;
@@ -129,12 +151,12 @@ static void wirelessSynch(){
   tof = ((tround1*tround2) - (treply1*treply2)) / (tround1 + tround2 + treply1 + treply2);
 
   distance = ctx.latestPacketRx - ctx.latestPacket;
-  clock_offset = distance - tof;
 
   if ( tof > 32500 && tof < 33000 ){
     ctx.tof = tof;
-    ctx.clockOffset = clock_offset;
   }
+  ctx.clockOffset = distance - ctx.tof;
+
   return;
 }
 
@@ -142,16 +164,27 @@ static void wirelessSynch(){
 static uint32_t estimateRemoteRx(){
 
   double remote_rx = ctx.txTime - ctx.clockOffset;
+
   double timediff = ctx.txTime - ctx.latestPacketRx;
-  double correction = ( timediff + ctx.cycles * 4.294967296e9) * (ctx.clockRatio - 1) + ctx.tof;
+  double correction = timediff * (ctx.clockRatio - 1) + ctx.tof;
+
   remote_rx += correction;
 
-
-  // clock offset follows sawtooth pattern, find out why
-  // when a packet is missed, one of the points of the sawtooth is missed and this causes a spike in the estimated rx roughly equal to the
-  // difference in value of the peaks times the ratio
-
   return (unsigned int) remote_rx;
+}
+
+static void estimateRxInOtherAnchor(uint32_t rangingPacketRx){
+
+  double remote_rx = rangingPacketRx - ctx.clockOffset;
+
+  double timediff = rangingPacketRx - ctx.latestPacketRx;
+  double correction = timediff * (ctx.clockRatio - 1);
+
+  remote_rx += correction;
+
+  printf(" rrx: %08x", (unsigned int) remote_rx);
+
+  //return (unsigned int)remote_rx;
 }
 
 static dwTime_t findTransmitTimeAsSoonAsPossible(dwDevice_t *dev)
@@ -236,12 +269,13 @@ static uint32_t startNextEvent(dwDevice_t *dev)
   if (ctx.nextTxTick < now){
 
     setupTx(dev);
-    printf("tx %02x%08x \r\n", (unsigned int) ctx.txTime_high8, (unsigned int) ctx.txTime);
+    //printf("tx %02x%08x \r\n", (unsigned int) ctx.txTime_high8, (unsigned int) ctx.txTime);
 
     ctx.pollPacket = ctx.latestPacket;
     ctx.pollPacketRx = ctx.latestPacketRx;
 
-    int delay_ms = 22 + ctx.anchorId; // having the exact same freq can result in clashes for many packets in a row
+    int delay_ms = ctx.anchorId; // having the exact same freq can result in clashes for many packets in a row
+    // therefore manually select id 21 and 24 for the two sniffers
     ctx.nextTxTick += M2T(delay_ms);
   } else {
     setupRx(dev);
@@ -268,7 +302,9 @@ static void handleRxPacket(dwDevice_t *dev)
   uint32_t answer_tx = 0;
   uint32_t answer_rx = 0;
 
-  printf("From %02x to %02x @%02x%08x: ", rxPacket.sourceAddress[0],
+  int source_address = rxPacket.sourceAddress[0];
+
+  printf("From %02x to %02x @%02x%08x: ", source_address,
                                         rxPacket.destAddress[0],
                                         (unsigned int) arrival.high8,
                                         (unsigned int) arrival.low32);
@@ -277,31 +313,52 @@ static void handleRxPacket(dwDevice_t *dev)
     printf("%02x", rxPacket.payload[i]);
   }
 
-  for (int i=0; i<4; i++) {
-    latest_timestamp += rxPacket.payload[i] << i*8;
+  if (source_address > 20){
+
+    for (int i=0; i<4; i++) {
+      latest_timestamp += rxPacket.payload[i] << i*8;
+    }
+
+    for (int i=0; i<4; i++) {
+      answer_tx += rxPacket.payload[i+4] << i*8;
+    }
+
+    for (int i=0; i<4; i++) {
+      answer_rx += rxPacket.payload[i+8] << i*8;
+    }
+
+    getClockRatio(arrival.full, latest_timestamp);
+
+    ctx.latestPacketRx = arrival.low32;
+    ctx.latestPacketRx_high8 = arrival.high8;
+    ctx.latestPacket = latest_timestamp;
+    ctx.answerPacketRx = answer_rx;
+    ctx.answerPacket = answer_tx;
+
+    wirelessSynch();
+  }
+  else{
+    /*printf("From %02x to %02x @%02x%08x: ", source_address,
+                                        rxPacket.destAddress[0],
+                                        (unsigned int) arrival.high8,
+                                        (unsigned int) arrival.low32);
+
+    for (int i=0; i<(dataLength - MAC802154_HEADER_LENGTH); i++) {
+      printf("%02x", rxPacket.payload[i]);
+    }*/
+
+    //uint32_t rx_in_clock_other_anchor =
+    estimateRxInOtherAnchor(arrival.low32);
+
+    //ctx.rxTimestampsInCurrentClock[source_address] = arrival.low32;
+    //ctx.rxTimestampsInRemoteClock[source_address] = rx_in_clock_other_anchor;
+
   }
 
-  for (int i=0; i<4; i++) {
-    answer_tx += rxPacket.payload[i+4] << i*8;
-  }
-
-  for (int i=0; i<4; i++) {
-    answer_rx += rxPacket.payload[i+8] << i*8;
-  }
-
-  getClockRatio(arrival.full, latest_timestamp);
-
-  ctx.latestPacketRx = arrival.low32;
-  ctx.latestPacketRx_high8 = arrival.high8;
-  ctx.latestPacket = latest_timestamp;
-  ctx.answerPacketRx = answer_rx;
-  ctx.answerPacket = answer_tx;
-
-  wirelessSynch();
-
-  //printf(" tx time in rx clock: %08x ", (unsigned int) (ctx.clockOffset + ctx.latestPacket));
-  printf(" ratio: %0.15f \r\n", ctx.clockRatio);
-  //printf("\r\n");
+  printf(" lprx: %08x", (unsigned int) ctx.latestPacketRx);
+  printf(" offset: %08x", (unsigned int) ctx.clockOffset);
+  printf(" ratio: %0.10f", ctx.clockRatio);
+  printf("\r\n");
 }
 
 static uint32_t snifferOnEvent(dwDevice_t *dev, uwbEvent_t event)
@@ -335,8 +392,12 @@ static void snifferInit(uwbConfig_t * newconfig, dwDevice_t *dev)
   ctx.answerPacketRx = 0;
   ctx.tof = 0;
   ctx.clockOffset = 0;
-  ctx.clockRatio = 1;
-  ctx.cycles = 0;
+  ctx.clockRatio = 1.0;
+  memset(ctx.clockRatioHist, 1.0, sizeof(ctx.clockRatioHist));
+  ctx.ratioUpdateIndex = 0;
+  //memset(ctx.rxTimestampsInCurrentClock, 0, sizeof(ctx.rxTimestampsInCurrentClock));
+  //memset(ctx.rxTimestampsInRemoteClock, 0, sizeof(ctx.rxTimestampsInRemoteClock));
+
   // Set the LED for anchor mode
   ledBlink(ledMode, false);
 }
